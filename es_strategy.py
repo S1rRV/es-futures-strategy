@@ -129,7 +129,14 @@ class StrategyConfig:
     rsi_period:     int   = 14
     rsi_long_min:   float = 50.0           # RSI must be > this for longs
     rsi_short_max:  float = 50.0           # RSI must be < this for shorts
-    vwap_filter:    bool  = True           # VWAP alignment filter
+    vwap_filter:    bool  = True           # VWAP alignment filter (price above/below)
+    # Fix 2: VWAP slope filter — instead of (or in addition to) checking
+    # price vs VWAP, check that VWAP itself is trending in the trade direction.
+    # vwap[now] > vwap[vwap_slope_period bars ago] = upward slope (long bias).
+    # This eliminates the "flicker" problem in choppy markets where price
+    # oscillates across a flat VWAP line.
+    vwap_slope_filter: bool  = False          # Enable VWAP slope check
+    vwap_slope_period: int   = 5              # Look-back bars for slope (default 5 min)
     max_entries_per_day: int = 2           # Max trades per session
 
     # --- Time Windows (ET) ---
@@ -162,6 +169,14 @@ class StrategyConfig:
     trail_pts:      float = 10.0           # Trailing stop distance (points)
     trail_atr_mult: float = 1.5            # Trailing stop ATR multiplier
     pt_fibo_ext:    float = 1.618          # Fibonacci extension level
+
+    # Fix 4: ATR target refresh.
+    # When True, the ATR_MULT target is re-evaluated on every bar using
+    # the current live ATR, so that expanding volatility after entry
+    # extends the target rather than locking you out of a big move.
+    # When False (original behaviour), the target is frozen at entry.
+    # Recommended: True for trending sessions, False for mean-reversion.
+    atr_target_dynamic: bool = True
     # Partial profit: book 50% at 1:2, trail rest
     partial_enabled:bool  = False
     partial_rr:     float = 2.0            # R:R for first partial target
@@ -188,11 +203,18 @@ class StrategyConfig:
     sma_200_filter: bool  = False          # 200 SMA directional filter
 
     # --- Slippage Model ---
-    # FIX 3: Toggle slippage/commission so backtest can compare
-    # theoretical-max (include_slippage=False) vs realistic (True)
-    include_slippage: bool  = True         # False = zero-slippage theoretical run
-    slippage_ticks:   float = 1.0          # Ticks of slippage per side (1 tick = 0.25 pts)
-    commission_rt:    float = 4.50         # Round-trip commission per contract ($)
+    # Toggle: False = zero-slippage theoretical run, True = realistic
+    include_slippage:  bool  = True
+    # Fix 3: Per-contract slippage model.
+    # The first contract fills at slippage_ticks_base ticks.
+    # Each additional contract adds slippage_ticks_increment ticks
+    # to model ES order book depth — larger size walks the book further.
+    # Example with 5 contracts, base=1, incr=0.5:
+    #   contract 1 → 1.0 tick, contract 2 → 1.5 ticks, ...
+    #   average fill = 2.0 ticks (vs 1.0 flat — a material difference)
+    slippage_ticks_base:      float = 1.0   # ticks for 1st contract
+    slippage_ticks_increment: float = 0.5   # additional ticks per extra contract
+    commission_rt:            float = 4.50  # round-trip commission per contract ($)
 
     # --- Scenarios to trade (set False to deactivate) ---
     active_scenarios: dict = field(default_factory=lambda: {
@@ -211,7 +233,23 @@ class StrategyConfig:
 
     @property
     def slippage_pts(self):
-        return self.slippage_ticks * self.tick_size
+        """Entry signal offset for 1 contract (base ticks only)."""
+        return self.slippage_ticks_base * self.tick_size
+
+    def effective_slippage_pts(self, qty: int) -> float:
+        """
+        Fix 3: Average slippage per contract for a given order size.
+        Models partial fills at different price levels as order size
+        walks the ES order book — larger orders incur more slippage.
+        """
+        if qty <= 1:
+            return self.slippage_ticks_base * self.tick_size
+        total_ticks = sum(
+            self.slippage_ticks_base + self.slippage_ticks_increment * i
+            for i in range(qty)
+        )
+        avg_ticks = total_ticks / qty
+        return avg_ticks * self.tick_size
 
 
 # ─────────────────────────────────────────────
@@ -452,6 +490,13 @@ class StrategyState:
         self.crossed_pdh_up:    bool = False
         self.crossed_pdl_down:  bool = False
 
+        # Fix 1: Open Drive classification
+        # True  = price opened outside range and has NEVER retraced back
+        #         through the breakout level → pure Scenario 1.1 / 3.1
+        # False = price has tested back through the level at least once
+        #         → qualifies for Scenario 1.2 / 3.2 retest-and-drive
+        self.open_drive_pure:   bool = True   # resets to False on first retest
+
         # Trade state
         self.in_trade:      bool  = False
         self.direction:     TradeDirection = TradeDirection.NONE
@@ -470,8 +515,12 @@ class StrategyState:
         self.daily_pnl:      float = 0.0
 
         # Indicator data (intraday 1-min bars)
-        self.intraday_bars: list[dict] = []
-        self.session_vwap:  float = 0.0
+        self.intraday_bars:  list[dict] = []
+        self.session_vwap:   float = 0.0
+        # Fix 2: VWAP slope — rolling history of VWAP values (one per bar)
+        # so FilterEngine can check vwap[now] > vwap[n bars ago] rather
+        # than just price > vwap (which flickers in choppy conditions).
+        self.vwap_history:   list[float] = []
 
         log.info("Daily state reset")
 
@@ -497,19 +546,30 @@ class ScenarioEngine:
 
         # ── MASTER SECTION 1: Open ABOVE PDH ──────────────────────
         if st.open_above_pdh:
+            # Fix 1: Track whether the market has retraced back below PDH
+            # AFTER the open.  The first time it does, open_drive_pure
+            # becomes False — this is the definitive gate separating
+            # Scenario 1.1 (pure open drive, no retest) from
+            # Scenario 1.2 (open → dip → recross = test-and-drive).
             if price < pdh:
                 st.touched_below_pdh = True
+                st.open_drive_pure   = False   # Fix 1: mark as retest, not pure drive
+
             if st.touched_below_pdh:
-                if price >= pdh:
-                    # 1.2 — recross PDH upward → LONG
+                # 1.2 — retraced below PDH, now recrossing upward → LONG
+                # Only valid if this is a retest (open_drive_pure == False)
+                if price >= pdh and not st.open_drive_pure:
                     if self.cfg.active_scenarios.get("1.2", True):
                         return "1.2", TradeDirection.LONG
+                # 1.4 — dipped below PDH and now breaks PDL → SHORT
                 if price < pdl:
-                    # 1.4 — breaks PDL → SHORT
                     if self.cfg.active_scenarios.get("1.4", True):
                         return "1.4", TradeDirection.SHORT
-                # 1.3 — stays between → NO TRADE (no action needed)
-            # 1.1 — never retraced below PDH → NO TRADE
+                # 1.3 — dipped below PDH, stays between PDH and PDL → NO TRADE
+
+            # 1.1 — opened above PDH, open_drive_pure still True,
+            # price has never retraced below PDH → pure open drive → NO TRADE
+            # (the market may continue up, but there is no confirmed retest setup)
             return "", TradeDirection.NONE
 
         # ── MASTER SECTION 2: Open INSIDE range ────────────────────
@@ -524,19 +584,26 @@ class ScenarioEngine:
 
         # ── MASTER SECTION 3: Open BELOW PDL ───────────────────────
         elif st.open_below_pdl:
+            # Fix 1 (mirror of Section 1): open_drive_pure tracks whether
+            # the market has bounced back above PDL after opening below it.
+            # If it has, open_drive_pure = False → eligible for 3.2 retest.
             if price > pdl:
                 st.touched_above_pdl = True
+                st.open_drive_pure   = False  # Fix 1: retest detected
+
             if st.touched_above_pdl:
-                if price < pdl:
-                    # 3.2 — re-breaks PDL → SHORT
+                # 3.2 — bounced above PDL, now re-breaks PDL downward → SHORT
+                # Only valid after confirmed retest (open_drive_pure == False)
+                if price < pdl and not st.open_drive_pure:
                     if self.cfg.active_scenarios.get("3.2", True):
                         return "3.2", TradeDirection.SHORT
+                # 3.4 — bounced above PDL and keeps going to break PDH → LONG
                 if price > pdh:
-                    # 3.4 — breaks PDH → LONG
                     if self.cfg.active_scenarios.get("3.4", True):
                         return "3.4", TradeDirection.LONG
-                # 3.3 — stays in range → NO TRADE
-            # 3.1 — stays below PDL → NO TRADE
+                # 3.3 — moved above PDL but stayed inside range → NO TRADE
+
+            # 3.1 — opened below PDL, never bounced above it → pure drive → NO TRADE
             return "", TradeDirection.NONE
 
         return "", TradeDirection.NONE
@@ -684,13 +751,42 @@ class FilterEngine:
             if direction == TradeDirection.SHORT and rsi > self.cfg.rsi_short_max:
                 return False, f"RSI {rsi:.1f} > {self.cfg.rsi_short_max} for SHORT"
 
-        # ── VWAP Alignment Filter ─────────────────────────────────────
+        # ── Fix 2: VWAP Alignment + Slope Filter ──────────────────────
+        # Two independently-toggled modes:
+        #
+        # vwap_filter (position-based): price above VWAP for longs,
+        # below for shorts. Fast but flickers on choppy flat-VWAP days.
+        #
+        # vwap_slope_filter (slope-based): VWAP[now] > VWAP[n bars ago]
+        # for longs (trending up), VWAP[now] < VWAP[n bars ago] for shorts.
+        # Stable gate — VWAP is cumulative so its slope reverses slowly,
+        # eliminating the flicker caused by price oscillating across a
+        # flat VWAP line. Use alone or in combination with vwap_filter.
         if self.cfg.vwap_filter and self.st.session_vwap > 0:
             cur_price = float(last_bar["Close"])
             if direction == TradeDirection.LONG and cur_price < self.st.session_vwap:
                 return False, f"Price {cur_price:.2f} below VWAP {self.st.session_vwap:.2f} for LONG"
             if direction == TradeDirection.SHORT and cur_price > self.st.session_vwap:
                 return False, f"Price {cur_price:.2f} above VWAP {self.st.session_vwap:.2f} for SHORT"
+
+        if self.cfg.vwap_slope_filter:
+            history = self.st.vwap_history
+            n = self.cfg.vwap_slope_period
+            if len(history) >= n + 1:
+                vwap_now  = history[-1]
+                vwap_prev = history[-(n + 1)]
+                slope_up   = vwap_now > vwap_prev
+                slope_down = vwap_now < vwap_prev
+                if direction == TradeDirection.LONG and not slope_up:
+                    return False, (
+                        f"VWAP slope flat/down ({vwap_prev:.2f}→{vwap_now:.2f} "
+                        f"over {n} bars) — no upward trend for LONG"
+                    )
+                if direction == TradeDirection.SHORT and not slope_down:
+                    return False, (
+                        f"VWAP slope flat/up ({vwap_prev:.2f}→{vwap_now:.2f} "
+                        f"over {n} bars) — no downward trend for SHORT"
+                    )
 
         # ── Volume Confirmation Filter ────────────────────────────────
         if self.cfg.vol_filter and len(bars) >= self.cfg.vol_avg_period:
@@ -875,6 +971,36 @@ class TradeManager:
             new_stop = self._best_price - sign * trail_dist
             self._maybe_tighten_stop(new_stop, direction)
 
+        # ── Fix 4: ATR Target Refresh ────────────────────────────────
+        # When atr_target_dynamic=True and pt_type=ATR_MULT, recalculate
+        # the profit target on every bar using the current ATR.
+        # This prevents the "frozen target too close" problem when
+        # volatility expands after entry — the target moves out with it.
+        # Only widens the target (never tightens it against the trade).
+        if cfg.atr_target_dynamic and cfg.pt_type == ProfitTargetType.ATR_MULT:
+            bars = st.intraday_bars
+            if len(bars) > cfg.atr_period:
+                live_atr     = calc_atr(bars, cfg.atr_period)
+                new_target   = round(st.entry_price + sign * cfg.pt_atr_mult * live_atr, 2)
+                # Only update if new target is further from entry (never pull it closer)
+                target_moved = (
+                    (direction == TradeDirection.LONG  and new_target > st.target_price) or
+                    (direction == TradeDirection.SHORT and new_target < st.target_price)
+                )
+                if target_moved:
+                    old_target = st.target_price
+                    st.target_price = new_target
+                    # Cancel and replace live target limit order if one exists
+                    if st.target_order_id:
+                        try:
+                            self.api.replace_stop(st.target_order_id, new_target)
+                        except Exception as e:
+                            log.warning("Could not refresh ATR target order: %s", e)
+                    log.info(
+                        "Fix 4: ATR target refreshed %.2f → %.2f (live ATR=%.2f)",
+                        old_target, new_target, live_atr
+                    )
+
         # ── Fix 3: LEVEL_REBREAK — reactive close-basis exit ────────
         # The document defines Level Rebreak as a DYNAMIC exit:
         # "Exit as soon as a trade occurs back below/above the entry
@@ -933,13 +1059,17 @@ class TradeManager:
         self._best_price = 0.0
 
     def _calculate_pnl(self, exit_price: float) -> float:
-        st = self.st
+        st  = self.st
+        cfg = self.cfg
+        qty = cfg.contracts
         sign = 1 if st.direction == TradeDirection.LONG else -1
-        gross = sign * (exit_price - st.entry_price) * self.cfg.point_value * self.cfg.contracts
-        # FIX 3: Only deduct slippage/commission when include_slippage=True
-        if self.cfg.include_slippage:
-            slippage_cost = self.cfg.slippage_pts * self.cfg.point_value * self.cfg.contracts * 2
-            return gross - slippage_cost - self.cfg.commission_rt * self.cfg.contracts
+        gross = sign * (exit_price - st.entry_price) * cfg.point_value * qty
+        # Fix 3: Per-contract slippage — entry and exit each walk the book
+        # so we apply effective_slippage_pts(qty) for both sides (x2).
+        if cfg.include_slippage:
+            avg_slip_pts  = cfg.effective_slippage_pts(qty)
+            slippage_cost = avg_slip_pts * cfg.point_value * qty * 2  # entry + exit
+            return gross - slippage_cost - cfg.commission_rt * qty
         return gross
 
 
@@ -1017,8 +1147,9 @@ class ESStrategy:
 
             self.state.intraday_bars.append(bar)
 
-            # Update VWAP
+            # Update VWAP and Fix 2: maintain rolling VWAP history for slope check
             self.state.session_vwap = calc_vwap(self.state.intraday_bars)
+            self.state.vwap_history.append(self.state.session_vwap)
 
             # Set opening bias on the first RTH bar
             if first_bar:
