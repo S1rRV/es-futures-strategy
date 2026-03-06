@@ -378,18 +378,40 @@ class SingleBacktest:
                         elif sign < 0 and new_stop < stop_price:
                             stop_price = new_stop
 
+                    # Fix 4: Friday forced exit in backtest
+                    bar_dt = datetime.fromisoformat(
+                        bar["TimeStamp"].replace("Z", "+00:00")
+                    ).astimezone(ET)
+                    friday_force_exit = False
+                    if cfg.friday_early_exit and bar_dt.weekday() == 4:
+                        cutoff = cfg.friday_exit_hour * 60 + cfg.friday_exit_minute
+                        if bar_dt.hour * 60 + bar_dt.minute >= cutoff:
+                            friday_force_exit = True
+
                     # Check stop hit
                     stop_hit = (direction == TradeDirection.LONG and low <= stop_price) or \
                                (direction == TradeDirection.SHORT and high >= stop_price)
                     # Check target hit
                     target_hit = (direction == TradeDirection.LONG and high >= target_price) or \
                                  (direction == TradeDirection.SHORT and low <= target_price)
+                    # Fix 3: Level Rebreak — close-basis check
+                    level_rebreak_exit = False
+                    if cfg.sl_type == StopLossType.LEVEL_REBREAK:
+                        ref = state.pdh if direction == TradeDirection.LONG else state.pdl
+                        level_rebreak_exit = (
+                            (direction == TradeDirection.LONG  and price < ref) or
+                            (direction == TradeDirection.SHORT and price > ref)
+                        )
 
                     exit_price = None
-                    if stop_hit:
+                    if friday_force_exit:
+                        exit_price = price
+                    elif stop_hit:
                         exit_price = stop_price
                     elif target_hit and target_price < 9000:
                         exit_price = target_price
+                    elif level_rebreak_exit:
+                        exit_price = price
 
                     if exit_price:
                         pnl = self._calc_pnl(direction, entry_price, exit_price)
@@ -414,6 +436,16 @@ class SingleBacktest:
 
                 # Enter
                 sign = 1 if sig_dir == TradeDirection.LONG else -1
+
+                # Fix 4: Friday no-new-entries gate in backtest
+                bar_dt_entry = datetime.fromisoformat(
+                    bar["TimeStamp"].replace("Z", "+00:00")
+                ).astimezone(ET)
+                if cfg.friday_early_exit and bar_dt_entry.weekday() == 4:
+                    cutoff = cfg.friday_exit_hour * 60 + cfg.friday_exit_minute
+                    if bar_dt_entry.hour * 60 + bar_dt_entry.minute >= cutoff:
+                        continue  # no new entries after Friday cutoff
+
                 entry_price = price + sign * cfg.slippage_pts
                 stop_price  = stop_calc.calculate(sig_dir, entry_price, scenario_id)
                 target_price= target_calc.calculate(sig_dir, entry_price, stop_price)
