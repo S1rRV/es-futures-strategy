@@ -1,0 +1,6 @@
+*.log
+*.pyc
+__pycache__/
+backtest_results.csv
+best_config.json
+.env
