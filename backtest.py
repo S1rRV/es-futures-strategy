@@ -229,6 +229,8 @@ class StatisticalStopAnalyser:
             for bar in day_bars:
                 state.intraday_bars.append(bar)
                 state.session_vwap = calc_vwap(state.intraday_bars)
+                # Fix 2: maintain VWAP history for slope filter
+                state.vwap_history.append(state.session_vwap)
                 price = float(bar["Close"])
                 high  = float(bar["High"])
                 low   = float(bar["Low"])
@@ -388,6 +390,20 @@ class SingleBacktest:
                         if bar_dt.hour * 60 + bar_dt.minute >= cutoff:
                             friday_force_exit = True
 
+                    # Fix 4: ATR dynamic target refresh in backtest
+                    if cfg.atr_target_dynamic and cfg.pt_type == ProfitTargetType.ATR_MULT:
+                        if len(state.intraday_bars) > cfg.atr_period:
+                            live_atr   = calc_atr(state.intraday_bars, cfg.atr_period)
+                            new_tgt    = round(
+                                entry_price + sign * cfg.pt_atr_mult * live_atr, 2
+                            )
+                            # Only widen — never pull target closer to entry
+                            if (direction == TradeDirection.LONG  and new_tgt > target_price) or                                (direction == TradeDirection.SHORT and new_tgt < target_price):
+                                target_price = new_tgt
+
+                    # Fix 1: open_drive_pure tracking in backtest
+                    state.open_drive_pure = getattr(state, "open_drive_pure", True)
+
                     # Check stop hit
                     stop_hit = (direction == TradeDirection.LONG and low <= stop_price) or \
                                (direction == TradeDirection.SHORT and high >= stop_price)
@@ -469,12 +485,12 @@ class SingleBacktest:
 
     def _calc_pnl(self, direction: TradeDirection, entry: float, exit_p: float) -> float:
         sign = 1 if direction == TradeDirection.LONG else -1
-        gross = sign * (exit_p - entry) * self.cfg.point_value * self.cfg.contracts
-        # FIX 3: Respect slippage toggle for theoretical vs realistic comparison
+        qty  = self.cfg.contracts
+        gross = sign * (exit_p - entry) * self.cfg.point_value * qty
+        # Fix 3: Per-contract slippage model — matches live engine
         if self.cfg.include_slippage:
-            return gross \
-                   - self.cfg.slippage_pts * self.cfg.point_value * self.cfg.contracts * 2 \
-                   - self.cfg.commission_rt * self.cfg.contracts
+            avg_slip = self.cfg.effective_slippage_pts(qty)
+            return gross                    - avg_slip * self.cfg.point_value * qty * 2                    - self.cfg.commission_rt * qty
         return gross
 
     def _group_by_session(self, bars: list[dict]) -> dict:
