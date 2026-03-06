@@ -16,7 +16,7 @@
 
 ### 1. Install dependencies
 ```bash
-pip install requests pytz pandas
+pip3 install requests pytz pandas
 ```
 
 ### 2. TradeStation API Credentials
@@ -42,7 +42,7 @@ ES futures roll quarterly. Update `symbol = "ESH25"` to the current front-month 
 
 ### Backtest first (always)
 ```bash
-python backtest.py
+python3 backtest.py
 ```
 - Outputs `backtest_results.csv` — all parameter combinations
 - Outputs `best_config.json` — top configuration by Expectancy
@@ -51,7 +51,7 @@ Set `use_quick_grid=False` in `BacktestRunner` for the full parameter sweep (~th
 
 ### Live / Paper Trading
 ```bash
-python es_strategy.py
+python3 es_strategy.py
 ```
 > ⚠️ `paper_trading = True` by default. Only set to `False` after thorough backtesting.
 
