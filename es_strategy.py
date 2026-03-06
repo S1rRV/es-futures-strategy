@@ -15,6 +15,9 @@ REQUIRES:
     pip install requests pytz pandas
 """
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import os
 import time
 import json

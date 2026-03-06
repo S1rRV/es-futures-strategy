@@ -4,3 +4,5 @@ __pycache__/
 backtest_results.csv
 best_config.json
 .env
+.venv
+
