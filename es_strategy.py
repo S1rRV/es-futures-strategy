@@ -15,9 +15,6 @@ REQUIRES:
     pip install requests pytz pandas
 """
 
-from dotenv import load_dotenv
-load_dotenv()
-
 import os
 import time
 import json
@@ -30,6 +27,15 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 from zoneinfo import ZoneInfo
+
+# ─────────────────────────────────────────────
+# ENVIRONMENT — load .env before anything else
+# ─────────────────────────────────────────────
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # reads .env from the current working directory
+except ImportError:
+    pass  # dotenv not installed — fall back to real environment variables
 
 # ─────────────────────────────────────────────
 # LOGGING
@@ -150,6 +156,12 @@ class StrategyConfig:
     daily_profit_lock_pct:float = 0.04    # Stop trading once 4% daily gain hit
     account_capital: float = 50000.0      # Account capital for position sizing
 
+    # --- PDC Bias Filter (Fix 1) ---
+    # FIX 1: PDC is now used as a directional bias confirmation filter.
+    # For LONG entries: current price must be above PDC.
+    # For SHORT entries: current price must be below PDC.
+    pdc_filter:     bool  = True           # Enable Previous Day Close bias filter
+
     # --- Market Regime Filters ---
     adx_filter:     bool  = False          # Enable ADX trend filter
     adx_period:     int   = 14
@@ -157,8 +169,11 @@ class StrategyConfig:
     sma_200_filter: bool  = False          # 200 SMA directional filter
 
     # --- Slippage Model ---
-    slippage_ticks: float = 1.0           # Ticks of slippage per side (1 tick = 0.25 pts)
-    commission_rt:  float = 4.50          # Round-trip commission per contract ($)
+    # FIX 3: Toggle slippage/commission so backtest can compare
+    # theoretical-max (include_slippage=False) vs realistic (True)
+    include_slippage: bool  = True         # False = zero-slippage theoretical run
+    slippage_ticks:   float = 1.0          # Ticks of slippage per side (1 tick = 0.25 pts)
+    commission_rt:    float = 4.50         # Round-trip commission per contract ($)
 
     # --- Scenarios to trade (set False to deactivate) ---
     active_scenarios: dict = field(default_factory=lambda: {
@@ -550,6 +565,17 @@ class FilterEngine:
         if self.st.daily_pnl >= profit_lock:
             return False, f"Daily profit lock hit (P&L: {self.st.daily_pnl:.2f})"
 
+        # ── PDC Bias Filter (Fix 1) ──────────────────────────────────
+        # PDC acts as a directional bias: longs only above PDC,
+        # shorts only below PDC. This uses the primary decision input
+        # that was fetched but previously unused in signal logic.
+        if self.cfg.pdc_filter and self.st.pdc > 0:
+            cur_price = float(last_bar["Close"])
+            if direction == TradeDirection.LONG and cur_price < self.st.pdc:
+                return False, f"Price {cur_price:.2f} below PDC {self.st.pdc:.2f} — no long bias"
+            if direction == TradeDirection.SHORT and cur_price > self.st.pdc:
+                return False, f"Price {cur_price:.2f} above PDC {self.st.pdc:.2f} — no short bias"
+
         bars = self.st.intraday_bars
         if not bars:
             return True, "OK"
@@ -791,8 +817,11 @@ class TradeManager:
         st = self.st
         sign = 1 if st.direction == TradeDirection.LONG else -1
         gross = sign * (exit_price - st.entry_price) * self.cfg.point_value * self.cfg.contracts
-        slippage_cost = self.cfg.slippage_pts * self.cfg.point_value * self.cfg.contracts * 2
-        return gross - slippage_cost - self.cfg.commission_rt * self.cfg.contracts
+        # FIX 3: Only deduct slippage/commission when include_slippage=True
+        if self.cfg.include_slippage:
+            slippage_cost = self.cfg.slippage_pts * self.cfg.point_value * self.cfg.contracts * 2
+            return gross - slippage_cost - self.cfg.commission_rt * self.cfg.contracts
+        return gross
 
 
 # ─────────────────────────────────────────────
