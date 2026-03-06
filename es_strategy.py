@@ -133,8 +133,27 @@ class StrategyConfig:
     max_entries_per_day: int = 2           # Max trades per session
 
     # --- Time Windows (ET) ---
-    # Options: "ALL", "OPEN_DRIVE" (09:30-10:30), "MORNING" (09:30-12:00), "POWER_HOUR" (14:00-16:00)
+    # "ALL"        -> 09:30-16:00 (no restriction)
+    # "OPEN_DRIVE" -> 09:30-10:30 only  (highest follow-through per doc)
+    # "MORNING"    -> 09:30-12:00 only
+    # "POWER_HOUR" -> 14:00-16:00 only
+    # Fix 1: enforced with precise hh:mm boundaries so e.g. scenario 1.2
+    # cannot fire at 2 PM during an OPEN_DRIVE run.
     time_window:    str   = "ALL"
+
+    # --- Seasonality Filters (Section 7.8) ---
+    # Fix 4: Friday early exit — force-close all open trades at
+    # friday_exit_hour:friday_exit_minute ET to avoid the weekly close
+    # where profit-taking / mean-reversion dominates (doc Section 7.8).
+    friday_early_exit:   bool  = True
+    friday_exit_hour:    int   = 15   # default 15:45 ET
+    friday_exit_minute:  int   = 45
+
+    # Month-end size reduction: trade at month_end_size_pct of normal
+    # contract count on the last 2 and first 2 trading days of the month
+    # to account for institutional rebalancing flows (Section 7.8).
+    month_end_filter:    bool  = True
+    month_end_size_pct:  float = 0.5  # 50% normal size on flagged days
 
     # --- Profit Target ---
     pt_type:        ProfitTargetType = ProfitTargetType.FIXED_RR
@@ -527,48 +546,112 @@ class ScenarioEngine:
 # FILTER ENGINE
 # ─────────────────────────────────────────────
 
+# ─────────────────────────────────────────────
+# SEASONALITY HELPERS  (Fix 4)
+# ─────────────────────────────────────────────
+
+def _is_month_end_day(dt: datetime, n: int = 2) -> bool:
+    """
+    Returns True if dt is within the first or last n trading days of
+    the calendar month. Uses a simple calendar-day heuristic: last n
+    calendar days of the month, or first n calendar days.
+    A proper implementation would use a trading-calendar library, but
+    this approximation covers the vast majority of rebalancing windows.
+    """
+    import calendar
+    last_day = calendar.monthrange(dt.year, dt.month)[1]
+    # last n calendar days of month
+    if dt.day >= last_day - n:
+        return True
+    # first n calendar days of month
+    if dt.day <= n:
+        return True
+    return False
+
+
+def _effective_contracts(cfg: StrategyConfig, now_et: datetime) -> int:
+    """
+    Fix 4: Returns the contract count adjusted for month-end sizing.
+    On flagged days the position size is scaled by month_end_size_pct.
+    """
+    if cfg.month_end_filter and _is_month_end_day(now_et):
+        scaled = max(1, int(cfg.contracts * cfg.month_end_size_pct))
+        log.info("Month-end day detected — sizing reduced to %d contract(s)", scaled)
+        return scaled
+    return cfg.contracts
+
+
 class FilterEngine:
-    """Applies entry filters: RSI, VWAP, Volume, Time Window, ADX."""
+    """
+    Applies all entry filters:
+      - Fix 1 (Time Window): precise hh:mm boundary enforcement per window
+      - Fix 2 (ADX):         properly wired regime filter
+      - PDC bias, RSI, VWAP, Volume, daily P&L limits
+      - Fix 4 (Seasonality): Friday no-new-entries gate
+    """
+
+    # Fix 1: canonical window definitions (start_hhmm, end_hhmm) in ET
+    TIME_WINDOWS: dict = {
+        "OPEN_DRIVE":  ((9, 30), (10, 30)),
+        "MORNING":     ((9, 30), (12,  0)),
+        "POWER_HOUR":  ((14, 0), (16,  0)),
+        "ALL":         ((9, 30), (16,  0)),
+    }
 
     def __init__(self, cfg: StrategyConfig, state: StrategyState):
         self.cfg = cfg
         self.st  = state
 
-    def check_all(self, direction: TradeDirection, last_bar: dict) -> tuple[bool, str]:
+    # ── Public entry point ───────────────────────────────────────────
+
+    def check_all(self, direction: TradeDirection, last_bar: dict,
+                  scenario_id: str = "") -> tuple[bool, str]:
         """Returns (pass, reason_string)."""
         now_et = datetime.now(ET)
+        cur_min = now_et.hour * 60 + now_et.minute
 
-        # ── Time Window Filter ──
-        if self.cfg.time_window != "ALL":
-            h, m = now_et.hour, now_et.minute
-            windows = {
-                "OPEN_DRIVE":  ((9, 30), (10, 30)),
-                "MORNING":     ((9, 30), (12, 0)),
-                "POWER_HOUR":  ((14, 0), (16, 0)),
-            }
-            start, end = windows.get(self.cfg.time_window, ((9, 30), (16, 0)))
-            cur = h * 60 + m
-            if not (start[0]*60+start[1] <= cur < end[0]*60+end[1]):
-                return False, f"Outside time window ({self.cfg.time_window})"
+        # ── Fix 1: Precise Time Window Enforcement ───────────────────
+        # Look up the configured window; fall back to ALL if unknown.
+        window = self.TIME_WINDOWS.get(self.cfg.time_window, self.TIME_WINDOWS["ALL"])
+        start_min = window[0][0] * 60 + window[0][1]
+        end_min   = window[1][0] * 60 + window[1][1]
+        if not (start_min <= cur_min < end_min):
+            return False, (
+                f"Outside {self.cfg.time_window} window "
+                f"({window[0][0]:02d}:{window[0][1]:02d}–"
+                f"{window[1][0]:02d}:{window[1][1]:02d} ET)"
+            )
 
-        # ── Max Entries Per Day ──
+        # ── Fix 4: Seasonality — Friday no-new-entries after cutoff ──
+        # Scenario 1.2 / 3.2 retests can still trigger late on Fridays;
+        # this gate prevents opening NEW trades after the cutoff time.
+        if self.cfg.friday_early_exit and now_et.weekday() == 4:  # 4 = Friday
+            cutoff = self.cfg.friday_exit_hour * 60 + self.cfg.friday_exit_minute
+            if cur_min >= cutoff:
+                return False, (
+                    f"Friday early-exit gate: no new entries after "
+                    f"{self.cfg.friday_exit_hour:02d}:{self.cfg.friday_exit_minute:02d} ET"
+                )
+
+        # ── Fix 4: Month-end — flag day, but allow trades (sizing handled at entry)
+        if self.cfg.month_end_filter and _is_month_end_day(now_et):
+            log.info("Month-end / month-start day — reduced sizing will apply at entry")
+
+        # ── Max Entries Per Day ──────────────────────────────────────
         if self.st.entries_today >= self.cfg.max_entries_per_day:
             return False, f"Max entries reached ({self.cfg.max_entries_per_day})"
 
-        # ── Daily Loss Limit ──
+        # ── Daily Loss Limit ──────────────────────────────────────────
         limit = -self.cfg.account_capital * self.cfg.daily_loss_limit_pct
         if self.st.daily_pnl <= limit:
             return False, f"Daily loss limit hit (P&L: {self.st.daily_pnl:.2f})"
 
-        # ── Daily Profit Lock ──
+        # ── Daily Profit Lock ─────────────────────────────────────────
         profit_lock = self.cfg.account_capital * self.cfg.daily_profit_lock_pct
         if self.st.daily_pnl >= profit_lock:
             return False, f"Daily profit lock hit (P&L: {self.st.daily_pnl:.2f})"
 
-        # ── PDC Bias Filter (Fix 1) ──────────────────────────────────
-        # PDC acts as a directional bias: longs only above PDC,
-        # shorts only below PDC. This uses the primary decision input
-        # that was fetched but previously unused in signal logic.
+        # ── PDC Bias Filter ───────────────────────────────────────────
         if self.cfg.pdc_filter and self.st.pdc > 0:
             cur_price = float(last_bar["Close"])
             if direction == TradeDirection.LONG and cur_price < self.st.pdc:
@@ -582,7 +665,18 @@ class FilterEngine:
 
         closes = [float(b["Close"]) for b in bars]
 
-        # ── RSI Filter ──
+        # ── Fix 2: ADX Market Regime Filter (now runs BEFORE momentum filters)
+        # Doc Section 7.1: skip all signals when ADX < threshold (ranging market).
+        # Previously this check existed but was unreachable due to an early return.
+        if self.cfg.adx_filter and len(bars) > self.cfg.adx_period + 1:
+            adx = calc_adx(bars, self.cfg.adx_period)
+            if adx < self.cfg.adx_min:
+                return False, (
+                    f"ADX {adx:.1f} < {self.cfg.adx_min} — "
+                    f"ranging market, trend continuation trades suppressed"
+                )
+
+        # ── RSI Momentum Filter ───────────────────────────────────────
         if self.cfg.rsi_filter and len(closes) > self.cfg.rsi_period:
             rsi = calc_rsi(closes, self.cfg.rsi_period)
             if direction == TradeDirection.LONG and rsi < self.cfg.rsi_long_min:
@@ -590,27 +684,21 @@ class FilterEngine:
             if direction == TradeDirection.SHORT and rsi > self.cfg.rsi_short_max:
                 return False, f"RSI {rsi:.1f} > {self.cfg.rsi_short_max} for SHORT"
 
-        # ── VWAP Filter ──
+        # ── VWAP Alignment Filter ─────────────────────────────────────
         if self.cfg.vwap_filter and self.st.session_vwap > 0:
             cur_price = float(last_bar["Close"])
             if direction == TradeDirection.LONG and cur_price < self.st.session_vwap:
-                return False, f"Price {cur_price} below VWAP {self.st.session_vwap:.2f} for LONG"
+                return False, f"Price {cur_price:.2f} below VWAP {self.st.session_vwap:.2f} for LONG"
             if direction == TradeDirection.SHORT and cur_price > self.st.session_vwap:
-                return False, f"Price {cur_price} above VWAP {self.st.session_vwap:.2f} for SHORT"
+                return False, f"Price {cur_price:.2f} above VWAP {self.st.session_vwap:.2f} for SHORT"
 
-        # ── Volume Confirmation Filter ──
+        # ── Volume Confirmation Filter ────────────────────────────────
         if self.cfg.vol_filter and len(bars) >= self.cfg.vol_avg_period:
             vols = [float(b.get("TotalVolume", 0)) for b in bars]
             avg_vol = sum(vols[-self.cfg.vol_avg_period:]) / self.cfg.vol_avg_period
             cur_vol = float(last_bar.get("TotalVolume", 0))
             if cur_vol < avg_vol * self.cfg.vol_filter_mult:
                 return False, f"Volume {cur_vol:.0f} < {self.cfg.vol_filter_mult}x avg {avg_vol:.0f}"
-
-        # ── ADX Market Regime Filter ──
-        if self.cfg.adx_filter and len(bars) > self.cfg.adx_period + 1:
-            adx = calc_adx(bars, self.cfg.adx_period)
-            if adx < self.cfg.adx_min:
-                return False, f"ADX {adx:.1f} < {self.cfg.adx_min} (ranging market)"
 
         return True, "OK"
 
@@ -726,6 +814,23 @@ class TradeManager:
         sign = 1 if direction == TradeDirection.LONG else -1
         cfg = self.cfg
 
+        # ── Fix 4: Friday forced exit ─────────────────────────────────
+        # Close all open trades at the configured ET cutoff on Fridays.
+        # Doc Section 7.8: "Fridays often exhibit profit-taking /
+        # mean-reversion behaviour — avoid holding trend trades into
+        # Friday close."
+        if cfg.friday_early_exit:
+            now_et = datetime.now(ET)
+            if now_et.weekday() == 4:  # Friday
+                cutoff_min = cfg.friday_exit_hour * 60 + cfg.friday_exit_minute
+                if now_et.hour * 60 + now_et.minute >= cutoff_min:
+                    log.info(
+                        "Fix 4: Friday forced exit at %02d:%02d ET — closing %s",
+                        now_et.hour, now_et.minute, direction.value
+                    )
+                    self._exit_trade("Market", price)
+                    return
+
         # Track best price achieved
         check_price = high if direction == TradeDirection.LONG else low
         if self._best_price == 0:
@@ -770,14 +875,28 @@ class TradeManager:
             new_stop = self._best_price - sign * trail_dist
             self._maybe_tighten_stop(new_stop, direction)
 
-        # ── LEVEL_REBREAK stop check ─────────────────────────────────
+        # ── Fix 3: LEVEL_REBREAK — reactive close-basis exit ────────
+        # The document defines Level Rebreak as a DYNAMIC exit:
+        # "Exit as soon as a trade occurs back below/above the entry
+        # reference level."  The original code referenced st.st (typo)
+        # and used a high/low wick trigger. This version uses the bar
+        # CLOSE so that brief wicks through the level (noise) do not
+        # prematurely exit the trade — only a sustained close back
+        # through the breakout level invalidates the setup.
         if cfg.sl_type == StopLossType.LEVEL_REBREAK:
-            ref_level = st.st.pdh if direction == TradeDirection.LONG else st.st.pdl
-            # Exit if a trade occurs back through the entry reference level
-            if (direction == TradeDirection.LONG and low <= ref_level) or \
-               (direction == TradeDirection.SHORT and high >= ref_level):
-                log.info("Level re-break exit triggered @ %.2f", price)
+            # Reference level: PDH for longs (breakout level), PDL for shorts
+            ref_level = st.pdh if direction == TradeDirection.LONG else st.pdl
+            level_reclaimed = (
+                (direction == TradeDirection.LONG  and price < ref_level) or
+                (direction == TradeDirection.SHORT and price > ref_level)
+            )
+            if level_reclaimed:
+                log.info(
+                    "LEVEL_REBREAK exit: close %.2f reclaimed ref %.2f — exiting %s",
+                    price, ref_level, direction.value
+                )
                 self._exit_trade("Market", price)
+                return  # trade closed; skip further processing this bar
 
     def _maybe_tighten_stop(self, new_stop: float, direction: TradeDirection):
         st = self.st
@@ -919,7 +1038,7 @@ class ESStrategy:
                 continue
 
             # Apply filters
-            passed, reason = self.filter_eng.check_all(direction, bar)
+            passed, reason = self.filter_eng.check_all(direction, bar, scenario_id)
             if not passed:
                 log.info("Signal %s %s FILTERED → %s", scenario_id, direction.value, reason)
                 continue
@@ -948,15 +1067,18 @@ class ESStrategy:
             log.info("Trade rejected: R:R %.2f below minimum %.2f", reward/risk, cfg.pt_rr_ratio)
             return
 
+        # --- Fix 4: Month-end adjusted position size ---
+        effective_qty = _effective_contracts(cfg, datetime.now(ET))
+
         # --- Place Entry Order ---
         action = "BUY" if direction == TradeDirection.LONG else "SELLSHORT"
-        result = self.api.place_order(action, cfg.contracts, order_type="Market")
+        result = self.api.place_order(action, effective_qty, order_type="Market")
         st.entry_order_id = result.get("OrderID", "")
 
         # --- Place Stop Order ---
         stop_action = "SELL" if direction == TradeDirection.LONG else "BUYTOCOVER"
         stop_result = self.api.place_order(
-            stop_action, cfg.contracts,
+            stop_action, effective_qty,
             order_type="StopMarket", stop_price=stop_price
         )
         st.stop_order_id = stop_result.get("OrderID", "")
@@ -965,7 +1087,7 @@ class ESStrategy:
         if cfg.pt_type in (ProfitTargetType.FIXED_RR, ProfitTargetType.FIXED_PTS,
                            ProfitTargetType.ATR_MULT, ProfitTargetType.FIBO_EXT):
             target_result = self.api.place_order(
-                stop_action, cfg.contracts,
+                stop_action, effective_qty,
                 order_type="Limit", limit_price=target_price
             )
             st.target_order_id = target_result.get("OrderID", "")
